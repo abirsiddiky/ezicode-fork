@@ -1309,12 +1309,33 @@ impl CompletionProvider for LspCompletionProvider {
         new_text: &str,
         _cx: &mut Context<InputState>,
     ) -> bool {
-        new_text
-            .chars()
-            .next()
-            .map(is_completion_trigger_char)
-            .unwrap_or(false)
+        let Some(c) = new_text.chars().next() else {
+            return false;
+        };
+        if is_completion_trigger_char(c) {
+            return true;
+        }
+        // Like Zed: any server's advertised trigger characters open the menu
+        // (Emmet advertises `)`, `]`, `}`, `@`, `$`, `*`, `+`, `>` and letters).
+        let advertised = std::iter::once(&self.client)
+            .chain(self.supplemental.iter())
+            .any(|client| advertises_trigger(client.capabilities().as_ref(), c));
+        // Emmet's `!` boilerplate (`html:5`) is only meaningful in markup, where
+        // `!` never means negation, so it opens the menu in html files only.
+        let bang = c == '!' && self.client.adapter.name == "vscode-html-language-server";
+        advertised || bang
     }
+}
+
+/// Whether a server's completion options list `c` as a trigger character.
+fn advertises_trigger(caps: Option<&lsp_types::ServerCapabilities>, c: char) -> bool {
+    caps.and_then(|caps| caps.completion_provider.as_ref())
+        .and_then(|options| options.trigger_characters.as_ref())
+        .is_some_and(|chars| {
+            chars
+                .iter()
+                .any(|s| s.len() == c.len_utf8() && s.starts_with(c))
+        })
 }
 
 pub struct LspHoverProvider {
@@ -2015,6 +2036,21 @@ mod tests {
             CompletionResponse::List(_) => panic!("merge should return a plain array"),
         };
         assert_eq!(labels, vec!["div", "h1", "h2"]);
+    }
+
+    #[test]
+    fn server_advertised_triggers_are_honoured() {
+        let caps = lsp_types::ServerCapabilities {
+            completion_provider: Some(lsp_types::CompletionOptions {
+                trigger_characters: Some(vec!["}".to_string(), "@".to_string()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(advertises_trigger(Some(&caps), '}'));
+        assert!(advertises_trigger(Some(&caps), '@'));
+        assert!(!advertises_trigger(Some(&caps), '!'));
+        assert!(!advertises_trigger(None, '}'));
     }
 
     #[test]
