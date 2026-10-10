@@ -118,14 +118,19 @@ impl InputState {
         // The query is the identifier being typed, up to the cursor. It must
         // not include the trigger character: after `<` it is empty, after `<h1`
         // it is `h1`. Completions are filtered against this text.
-        let before_cursor = self.text.slice(0..new_offset).to_string();
+        // Only a short window before the cursor is copied: a whole-document
+        // copy on every keystroke is needless work on the UI thread.
+        let window_start = self
+            .text
+            .char_to_byte(self.text.byte_to_char(new_offset.saturating_sub(128)));
+        let before_cursor = self.text.slice(window_start..new_offset).to_string();
         let word_start = before_cursor
             .char_indices()
             .rev()
             .find(|(_, c)| !(c.is_alphanumeric() || *c == '_' || *c == '-'))
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(0);
-        let query = before_cursor[word_start..].to_string();
+            .map(|(i, c)| window_start + i + c.len_utf8())
+            .unwrap_or(window_start);
+        let query = self.text.slice(word_start..new_offset).to_string();
         _ = menu.update(cx, |menu, _| {
             menu.update_query(word_start, query.clone());
         });
@@ -135,9 +140,26 @@ impl InputState {
             trigger_character: Some(query),
         };
 
-        let provider_responses =
-            provider.completions(&self.text, new_offset, completion_context, window, cx);
         self._context_menu_task = cx.spawn_in(window, async move |editor, cx| {
+            // Wait briefly. While typing quickly only the last keystroke sends
+            // a request, and the request is skipped if the cursor has moved.
+            smol::Timer::after(std::time::Duration::from_millis(50)).await;
+            let requested = editor.update_in(cx, |editor, window, cx| {
+                if editor.cursor() != new_offset {
+                    return None;
+                }
+                Some(provider.completions(
+                    &editor.text,
+                    new_offset,
+                    completion_context,
+                    window,
+                    cx,
+                ))
+            });
+            let Ok(Some(provider_responses)) = requested else {
+                return Ok(());
+            };
+
             let mut completions: Vec<CompletionItem> = vec![];
             if let Some(provider_responses) = provider_responses.await.ok() {
                 match provider_responses {
