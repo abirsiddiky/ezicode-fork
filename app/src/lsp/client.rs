@@ -223,8 +223,16 @@ impl LspManager {
 
     pub fn reserve_server(&mut self, lang: &str) -> Option<ServerLaunch> {
         let adapter = super::adapter::adapter_for_language(lang)?;
+        self.reserve_adapter(adapter)
+    }
+
+    /// Reserve the start of any server, primary or supplemental.
+    pub fn reserve_adapter(
+        &mut self,
+        adapter: &'static super::adapter::ServerAdapter,
+    ) -> Option<ServerLaunch> {
         let name = adapter.name;
-        if self.client_for(lang).is_some() {
+        if self.clients.get(name).is_some_and(|c| c.is_alive()) {
             return None;
         }
         if self.installing.contains(name)
@@ -429,6 +437,24 @@ impl LspManager {
             .filter(|c| c.is_alive())
     }
 
+    /// The live supplemental servers (Emmet, ...) for `lang`.
+    pub fn supplemental_clients_for(&self, lang: &str) -> Vec<Arc<LspClient>> {
+        super::adapter::supplemental_adapters_for_language(lang)
+            .into_iter()
+            .filter_map(|adapter| self.clients.get(adapter.name).cloned())
+            .filter(|c| c.is_alive())
+            .collect()
+    }
+
+    /// Every live server that should see documents of `lang`: the primary
+    /// server first, then the supplemental ones.
+    pub fn clients_for_language(&self, lang: &str) -> Vec<Arc<LspClient>> {
+        self.client_for(lang)
+            .into_iter()
+            .chain(self.supplemental_clients_for(lang))
+            .collect()
+    }
+
     /// Status of the server that handles `lang`.
     pub fn status_for_language(&self, lang: &str) -> Option<ServerStatus> {
         let adapter = super::adapter::adapter_for_language(lang)?;
@@ -451,19 +477,19 @@ impl LspManager {
     }
 
     pub fn change_document(&mut self, path: &Path, lang: &str, text: String) {
-        if let Some(client) = self.client_for(lang) {
-            client.did_change(path, text);
+        for client in self.clients_for_language(lang) {
+            client.did_change(path, text.clone());
         }
     }
 
     pub fn close_document(&mut self, path: &Path, lang: &str) {
-        if let Some(client) = self.client_for(lang) {
+        for client in self.clients_for_language(lang) {
             client.did_close(path);
         }
     }
 
     pub fn save_document(&mut self, path: &Path, lang: &str, text: &str) {
-        if let Some(client) = self.client_for(lang) {
+        for client in self.clients_for_language(lang) {
             client.did_save(path, text);
         }
     }
@@ -1160,9 +1186,15 @@ impl Drop for LspClient {
     }
 }
 
-pub fn attach_lsp_providers(state: &mut InputState, client: Arc<LspClient>, path: PathBuf) {
+pub fn attach_lsp_providers(
+    state: &mut InputState,
+    client: Arc<LspClient>,
+    path: PathBuf,
+    supplemental: Vec<Arc<LspClient>>,
+) {
     state.lsp.completion_provider = Some(Rc::new(LspCompletionProvider {
         client: client.clone(),
+        supplemental,
         path: path.clone(),
     }));
     state.lsp.hover_provider = Some(Rc::new(LspHoverProvider {
@@ -1181,12 +1213,43 @@ pub fn is_completion_trigger_char(c: char) -> bool {
         || matches!(
             c,
             '_' | '.' | '$' | ':' | '/' | '<' | '"' | '#' | '@' | '-' | '>' | '(' | '[' | '{'
+                // Emmet abbreviations: `li*3`, `ul>li+li`.
+                | '*'
+                | '+'
         )
 }
 
 pub struct LspCompletionProvider {
     client: Arc<LspClient>,
+    /// Extra servers (Emmet) whose items are appended after the primary's.
+    supplemental: Vec<Arc<LspClient>>,
     path: PathBuf,
+}
+
+/// True while the user is typing a tag name right after `<` or `</`.
+pub fn is_typing_tag_name(before_cursor: &str) -> bool {
+    let word_start = match before_cursor
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '-' || *c == ':'))
+    {
+        Some((i, c)) => i + c.len_utf8(),
+        None => 0,
+    };
+    let before_word = &before_cursor[..word_start];
+    before_word.ends_with('<') || before_word.ends_with("</")
+}
+
+/// Concatenate the items of several completion responses, keeping their order.
+fn merge_completion_responses(responses: Vec<CompletionResponse>) -> CompletionResponse {
+    let mut items = Vec::new();
+    for response in responses {
+        match response {
+            CompletionResponse::Array(list) => items.extend(list),
+            CompletionResponse::List(list) => items.extend(list.items),
+        }
+    }
+    CompletionResponse::Array(items)
 }
 
 impl CompletionProvider for LspCompletionProvider {
@@ -1198,12 +1261,18 @@ impl CompletionProvider for LspCompletionProvider {
         _window: &mut Window,
         cx: &mut Context<InputState>,
     ) -> Task<anyhow::Result<CompletionResponse>> {
-        if !self.client.supports(|c| c.completion_provider.is_some()) {
-            return Task::ready(Ok(CompletionResponse::Array(vec![])));
-        }
-        let client = self.client.clone();
-        let path = self.path.clone();
         let text_str = text.to_string();
+        // Emmet's abbreviation expansions are wrong while a tag name is being
+        // typed (`<h`, `</p`): only the HTML server answers there.
+        let before_cursor = text_str.get(..offset).unwrap_or("");
+        let tail = before_cursor
+            .get(before_cursor.len().saturating_sub(32)..)
+            .unwrap_or("");
+        let mut clients = vec![self.client.clone()];
+        if !is_typing_tag_name(tail) {
+            clients.extend(self.supplemental.iter().cloned());
+        }
+        let path = self.path.clone();
         let position = text.offset_to_position(offset);
 
         let trigger_character = trigger.trigger_character.filter(|c| c.chars().count() == 1);
@@ -1232,11 +1301,32 @@ impl CompletionProvider for LspCompletionProvider {
             let Ok(params) = serde_json::to_value(params) else {
                 return Ok(CompletionResponse::Array(vec![]));
             };
-            let response =
-                client.request_with_text(&path, &text_str, "textDocument/completion", params);
-            Ok(response
-                .and_then(|v| serde_json::from_value::<CompletionResponse>(v).ok())
-                .unwrap_or(CompletionResponse::Array(vec![])))
+
+            // Ask every server at once: a slow or silent server must not delay
+            // the others. A server that is down or answers badly contributes
+            // nothing and the rest still show.
+            let responses: Vec<CompletionResponse> = std::thread::scope(|scope| {
+                let handles: Vec<_> = clients
+                    .iter()
+                    .filter(|c| {
+                        c.is_alive() && c.supports(|caps| caps.completion_provider.is_some())
+                    })
+                    .map(|client| {
+                        let params = params.clone();
+                        let path = &path;
+                        let text = &text_str;
+                        scope.spawn(move || {
+                            client.request_with_text(path, text, "textDocument/completion", params)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .filter_map(|handle| handle.join().ok().flatten())
+                    .filter_map(|v| serde_json::from_value::<CompletionResponse>(v).ok())
+                    .collect()
+            });
+            Ok(merge_completion_responses(responses))
         })
     }
 
@@ -1246,12 +1336,33 @@ impl CompletionProvider for LspCompletionProvider {
         new_text: &str,
         _cx: &mut Context<InputState>,
     ) -> bool {
-        new_text
-            .chars()
-            .next()
-            .map(is_completion_trigger_char)
-            .unwrap_or(false)
+        let Some(c) = new_text.chars().next() else {
+            return false;
+        };
+        if is_completion_trigger_char(c) {
+            return true;
+        }
+        // Like Zed: any server's advertised trigger characters open the menu
+        // (Emmet advertises `)`, `]`, `}`, `@`, `$`, `*`, `+`, `>` and letters).
+        let advertised = std::iter::once(&self.client)
+            .chain(self.supplemental.iter())
+            .any(|client| advertises_trigger(client.capabilities().as_ref(), c));
+        // Emmet's `!` boilerplate (`html:5`) is only meaningful in markup, where
+        // `!` never means negation, so it opens the menu in html files only.
+        let bang = c == '!' && self.client.adapter.name == "vscode-html-language-server";
+        advertised || bang
     }
+}
+
+/// Whether a server's completion options list `c` as a trigger character.
+fn advertises_trigger(caps: Option<&lsp_types::ServerCapabilities>, c: char) -> bool {
+    caps.and_then(|caps| caps.completion_provider.as_ref())
+        .and_then(|options| options.trigger_characters.as_ref())
+        .is_some_and(|chars| {
+            chars
+                .iter()
+                .any(|s| s.len() == c.len_utf8() && s.starts_with(c))
+        })
 }
 
 pub struct LspHoverProvider {
@@ -1933,10 +2044,62 @@ mod tests {
     }
 
     #[test]
+    fn completion_responses_are_merged_in_server_order() {
+        let item = |label: &str| lsp_types::CompletionItem {
+            label: label.to_string(),
+            ..Default::default()
+        };
+        let merged = merge_completion_responses(vec![
+            CompletionResponse::Array(vec![item("div")]),
+            CompletionResponse::List(lsp_types::CompletionList {
+                is_incomplete: false,
+                items: vec![item("h1"), item("h2")],
+                ..Default::default()
+            }),
+            CompletionResponse::Array(vec![]),
+        ]);
+        let labels: Vec<_> = match merged {
+            CompletionResponse::Array(items) => items.into_iter().map(|i| i.label).collect(),
+            CompletionResponse::List(_) => panic!("merge should return a plain array"),
+        };
+        assert_eq!(labels, vec!["div", "h1", "h2"]);
+    }
+
+    #[test]
+    fn tag_name_context_is_detected() {
+        assert!(is_typing_tag_name("<h"));
+        assert!(is_typing_tag_name("<div>\n  <p"));
+        assert!(is_typing_tag_name("</sec"));
+        assert!(is_typing_tag_name("<my-el"));
+        assert!(!is_typing_tag_name("<div class=\"x\""));
+        assert!(!is_typing_tag_name("h1"));
+        assert!(!is_typing_tag_name("<div>text h"));
+        assert!(!is_typing_tag_name("é <h1>x"));
+    }
+
+    #[test]
+    fn server_advertised_triggers_are_honoured() {
+        let caps = lsp_types::ServerCapabilities {
+            completion_provider: Some(lsp_types::CompletionOptions {
+                trigger_characters: Some(vec!["}".to_string(), "@".to_string()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(advertises_trigger(Some(&caps), '}'));
+        assert!(advertises_trigger(Some(&caps), '@'));
+        assert!(!advertises_trigger(Some(&caps), '!'));
+        assert!(!advertises_trigger(None, '}'));
+    }
+
+    #[test]
     fn test_trigger_chars() {
         assert!(is_completion_trigger_char('a'));
         assert!(is_completion_trigger_char('_'));
         assert!(is_completion_trigger_char('.'));
+        assert!(is_completion_trigger_char('*'));
+        assert!(is_completion_trigger_char('+'));
+        assert!(is_completion_trigger_char('>'));
         assert!(!is_completion_trigger_char(' '));
         assert!(!is_completion_trigger_char(';'));
     }

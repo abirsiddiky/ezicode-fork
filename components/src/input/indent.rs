@@ -217,6 +217,10 @@ impl InputState {
         if self.accept_inline_completion(window, cx) {
             return;
         }
+        // Tab moves to the next snippet tabstop while a snippet is active.
+        if self.snippet_jump(true, cx) {
+            return;
+        }
         self.indent(false, window, cx);
     }
 
@@ -230,6 +234,9 @@ impl InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.snippet_jump(false, cx) {
+            return;
+        }
         self.outdent(false, window, cx);
     }
 

@@ -10,6 +10,7 @@ mod completions;
 mod definitions;
 mod document_colors;
 mod hover;
+pub(crate) mod snippet;
 
 pub use code_actions::*;
 pub use completions::*;

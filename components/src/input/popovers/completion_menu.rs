@@ -6,7 +6,7 @@ use gpui::{
     Point, Render, RenderOnce, SharedString, Styled, StyledText, Subscription, Window, canvas,
     deferred, div, prelude::FluentBuilder, px, relative,
 };
-use lsp_types::{CompletionItem, CompletionTextEdit};
+use lsp_types::{CompletionItem, CompletionTextEdit, Documentation, InsertTextFormat};
 
 const MAX_MENU_WIDTH: Pixels = px(320.);
 const MAX_MENU_HEIGHT: Pixels = px(240.);
@@ -21,6 +21,146 @@ use crate::{
     label::Label,
     list::{List, ListDelegate, ListEvent, ListState},
 };
+
+/// Keep the items that match `query` and order them best match first.
+///
+/// Matching is case-insensitive. Prefix matches rank above matches with gaps;
+/// within each group the server's order is kept. An empty query keeps all items.
+pub(crate) fn filter_and_rank(items: Vec<CompletionItem>, query: &str) -> Vec<CompletionItem> {
+    if query.is_empty() {
+        return items;
+    }
+    let query = query.to_lowercase();
+    let mut scored: Vec<(u8, usize, CompletionItem)> = items
+        .into_iter()
+        .enumerate()
+        .filter_map(|(ix, item)| {
+            let candidate = item.filter_text.as_deref().unwrap_or(&item.label).to_lowercase();
+            match_rank(&query, &candidate).map(|rank| (rank, ix, item))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored.into_iter().map(|(_, _, item)| item).collect()
+}
+
+/// 2 for a prefix match, 1 when the query's characters appear in order, `None`
+/// otherwise.
+fn match_rank(query: &str, candidate: &str) -> Option<u8> {
+    if candidate.starts_with(query) {
+        return Some(2);
+    }
+    let mut chars = candidate.chars();
+    query
+        .chars()
+        .all(|q| chars.any(|c| c == q))
+        .then_some(1)
+}
+
+/// The documentation shown beside a completion item.
+///
+/// Snippet bodies (Emmet's `!` boilerplate, for example) are shown expanded,
+/// as VS Code does: tabstops and placeholders become their default text and
+/// the result goes in a code block. No `$1` or `${...}` markers reach the popup.
+fn display_documentation(item: &CompletionItem) -> Option<String> {
+    let raw = match item.documentation.as_ref()? {
+        Documentation::String(s) => s.clone(),
+        Documentation::MarkupContent(markup) => markup.value.clone(),
+    };
+    if item.insert_text_format != Some(InsertTextFormat::SNIPPET) {
+        return Some(raw);
+    }
+    let expanded = crate::input::lsp::snippet::parse(&raw).text;
+    if expanded == raw {
+        Some(raw)
+    } else {
+        Some(format!("```\n{expanded}\n```"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lsp_types::MarkupContent;
+
+    fn item(doc: &str, snippet: bool) -> CompletionItem {
+        CompletionItem {
+            label: "!".into(),
+            documentation: Some(Documentation::String(doc.into())),
+            insert_text_format: snippet.then_some(InsertTextFormat::SNIPPET),
+            ..Default::default()
+        }
+    }
+
+    fn labels(items: &[CompletionItem]) -> Vec<&str> {
+        items.iter().map(|i| i.label.as_str()).collect()
+    }
+
+    fn labelled(names: &[&str]) -> Vec<CompletionItem> {
+        names
+            .iter()
+            .map(|n| CompletionItem {
+                label: n.to_string(),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn typed_tag_name_filters_the_tag_list() {
+        let items = labelled(&["html", "head", "h1", "h2", "title", "hr"]);
+        let ranked = filter_and_rank(items, "h1");
+        assert_eq!(labels(&ranked), vec!["h1"]);
+    }
+
+    #[test]
+    fn prefix_matches_come_before_gap_matches_and_keep_server_order() {
+        let items = labelled(&["ahead", "head", "h2", "heading"]);
+        let ranked = filter_and_rank(items, "he");
+        assert_eq!(labels(&ranked), vec!["head", "heading", "ahead"]);
+    }
+
+    #[test]
+    fn filter_is_case_insensitive_and_empty_query_keeps_everything() {
+        let items = labelled(&["DIV", "span"]);
+        assert_eq!(labels(&filter_and_rank(items.clone(), "di")), vec!["DIV"]);
+        assert_eq!(labels(&filter_and_rank(items, "")), vec!["DIV", "span"]);
+    }
+
+    #[test]
+    fn filter_uses_filter_text_when_present() {
+        let mut item = labelled(&["!"]).remove(0);
+        item.filter_text = Some("html5 boilerplate".into());
+        assert_eq!(filter_and_rank(vec![item], "html").len(), 1);
+    }
+
+    #[test]
+    fn snippet_documentation_hides_markers() {
+        let doc = display_documentation(&item("<div>${5:Document}</div>$6", true)).unwrap();
+        assert_eq!(doc, "```\n<div>Document</div>\n```");
+        assert!(!doc.contains('$'));
+    }
+
+    #[test]
+    fn plain_documentation_is_untouched() {
+        let doc = display_documentation(&item("costs $5 ${x}", false)).unwrap();
+        assert_eq!(doc, "costs $5 ${x}");
+    }
+
+    #[test]
+    fn snippet_without_markers_is_not_fenced() {
+        assert_eq!(display_documentation(&item("plain", true)).unwrap(), "plain");
+    }
+
+    #[test]
+    fn markup_documentation_is_read() {
+        let mut i = item("", false);
+        i.documentation = Some(Documentation::MarkupContent(MarkupContent {
+            kind: lsp_types::MarkupKind::Markdown,
+            value: "**hi**".into(),
+        }));
+        assert_eq!(display_documentation(&i).unwrap(), "**hi**");
+    }
+}
 
 struct ContextMenuDelegate {
     query: SharedString,
@@ -255,12 +395,18 @@ impl CompletionMenu {
                     range = offset..offset;
                 }
 
-                editor.replace_text_in_range_silent(
-                    Some(editor.range_to_utf16(&range)),
-                    &new_text,
-                    window,
-                    cx,
-                );
+                if item.insert_text_format == Some(InsertTextFormat::SNIPPET) {
+                    // `$1`, `${1:x}`, `$0`, ... must never reach the buffer.
+                    let snippet = crate::input::lsp::snippet::parse(&new_text);
+                    editor.insert_snippet(range, &snippet, window, cx);
+                } else {
+                    editor.replace_text_in_range_silent(
+                        Some(editor.range_to_utf16(&range)),
+                        &new_text,
+                        window,
+                        cx,
+                    );
+                }
                 editor.completion_inserting = false;
 
                 editor.focus(window, cx);
@@ -331,9 +477,9 @@ impl CompletionMenu {
     }
 
     pub(crate) fn update_query(&mut self, start_offset: usize, query: impl Into<SharedString>) {
-        if self.trigger_start_offset.is_none() {
-            self.trigger_start_offset = Some(start_offset);
-        }
+        // The start moves with the word being typed, so accepting an item
+        // replaces the whole word (not the trigger character before it).
+        self.trigger_start_offset = Some(start_offset);
         self.query = query.into();
     }
 
@@ -344,7 +490,9 @@ impl CompletionMenu {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let items = items.into();
+        // Servers return the whole candidate list and expect the editor to
+        // filter it by what was typed (`<h1` must show `h1`, not every tag).
+        let items = filter_and_rank(items.into(), &self.query);
         self.offset = offset;
         self.open = true;
         self.list.update(cx, |this, cx| {
@@ -406,7 +554,7 @@ impl Render for CompletionMenu {
             .read(cx)
             .delegate()
             .selected_item()
-            .and_then(|item| item.documentation.clone());
+            .and_then(|item| display_documentation(item));
 
         let max_width = MAX_MENU_WIDTH.min(window.bounds().size.width - pos.x);
         let abs_pos = self.editor.read(cx).input_bounds.origin + pos;
@@ -438,11 +586,7 @@ impl Render for CompletionMenu {
                             .size_full(),
                         ),
                 )
-                .when_some(selected_documentation, |this, documentation| {
-                    let mut doc = match documentation {
-                        lsp_types::Documentation::String(s) => s.clone(),
-                        lsp_types::Documentation::MarkupContent(mc) => mc.value.clone(),
-                    };
+                .when_some(selected_documentation, |this, mut doc| {
                     if vertical_layout {
                         doc = doc.split("\n").next().unwrap_or_default().to_string();
                     }

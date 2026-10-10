@@ -13,6 +13,7 @@ use std::rc::Rc;
 use sum_tree::Bias;
 use unicode_segmentation::*;
 
+use super::lsp::snippet::SnippetSession;
 use super::{
     blink_cursor::BlinkCursor, change::Change, element::TextElement, mask_pattern::MaskPattern,
     mode::InputMode, number_input, text_wrapper::TextWrapper,
@@ -298,6 +299,8 @@ pub struct InputState {
     pub(super) mouse_context_menu: Entity<MouseContextMenu>,
     /// A flag to indicate if we are currently inserting a completion item.
     pub(super) completion_inserting: bool,
+    /// The tabstops of the snippet being edited, if a snippet was just inserted.
+    pub(super) snippet_session: Option<SnippetSession>,
     pub(super) hover_popover: Option<Entity<HoverPopover>>,
     /// The LSP definitions locations for "Go to Definition" feature.
     pub(super) hover_definition: HoverDefinition,
@@ -391,6 +394,7 @@ impl InputState {
             context_menu: None,
             mouse_context_menu,
             completion_inserting: false,
+            snippet_session: None,
             hover_popover: None,
             hover_definition: HoverDefinition::default(),
             silent_replace_text: false,
@@ -1124,6 +1128,9 @@ impl InputState {
             return;
         }
 
+        // Escape leaves snippet tabstop navigation but keeps the text.
+        self.snippet_session = None;
+
         // Clear inline completion on escape
         if self.has_inline_completion() {
             self.clear_inline_completion(cx);
@@ -1541,6 +1548,7 @@ impl InputState {
                 self.selected_range.end = word_range.end;
             }
         }
+        self.check_snippet_session_bounds();
         if self.selected_range.is_empty() {
             self.update_preferred_column();
         }
@@ -1880,6 +1888,7 @@ impl EntityInputHandler for InputState {
             }
         }
 
+        self.snippet_session_on_edit(range.clone(), new_text.len());
         self.push_history(&old_text, &range, &new_text);
         self.history.end_grouping();
         if let Some(diagnostics) = self.mode.diagnostics_mut() {
@@ -1892,6 +1901,7 @@ impl EntityInputHandler for InputState {
         self.lsp.update(&self.text, window, cx);
         self.selected_range = (new_offset..new_offset).into();
         self.ime_marked_range.take();
+        self.check_snippet_session_bounds();
         self.update_preferred_column();
         self.update_search(cx);
         self.mode.update_auto_grow(&self.text_wrapper);
@@ -1960,6 +1970,7 @@ impl EntityInputHandler for InputState {
         }
         self.mode.update_auto_grow(&self.text_wrapper);
         self.history.start_grouping();
+        self.snippet_session_on_edit(range.clone(), new_text.len());
         self.push_history(&old_text, &range, new_text);
         cx.notify();
     }
