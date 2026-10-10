@@ -4363,17 +4363,23 @@ impl Workspace {
         editor: &Entity<InputState>,
         cx: &mut Context<Self>,
     ) -> bool {
-        let (client, launch) = {
+        // Primary server (diagnostics, hover, definitions, ...) plus any
+        // supplemental servers for this language (Emmet completions). All of
+        // them are started on demand, the same way Zed starts its extensions.
+        let (client, supplemental, launches) = {
             let mut lsp = self.lsp.lock().unwrap();
             let client = lsp.client_for(lang_id);
-            let launch = if client.is_none() {
-                lsp.reserve_server(lang_id)
-            } else {
-                None
-            };
-            (client, launch)
+            let mut launches = Vec::new();
+            if client.is_none() {
+                launches.extend(lsp.reserve_server(lang_id));
+            }
+            for adapter in crate::lsp::adapter::supplemental_adapters_for_language(lang_id) {
+                launches.extend(lsp.reserve_adapter(adapter));
+            }
+            let supplemental = lsp.supplemental_clients_for(lang_id);
+            (client, supplemental, launches)
         };
-        if let Some(launch) = launch {
+        for launch in launches {
             let token = self.session.clone();
             let manager = self.lsp.clone();
             let task = cx.spawn(async move |this, cx| {
@@ -4399,14 +4405,26 @@ impl Workspace {
             });
             self.track_project_task(task, cx);
         }
+
+        // Every server that sees the document gets didOpen exactly once.
+        // `last_text` is set by didOpen and cleared by didClose, so it tells us
+        // whether this server already has the document open.
+        let text = editor.read(cx).value().to_string();
+        for server in &supplemental {
+            if server.last_text(path).is_none() {
+                server.did_open(path, lang_id, &text);
+            }
+        }
+
         let Some(client) = client else {
             return false;
         };
-        let text = editor.read(cx).value().to_string();
-        client.did_open(path, lang_id, &text);
+        if client.last_text(path).is_none() {
+            client.did_open(path, lang_id, &text);
+        }
         let lsp_path = path.to_path_buf();
         editor.update(cx, move |state, _cx| {
-            crate::lsp::attach_lsp_providers(state, client, lsp_path);
+            crate::lsp::attach_lsp_providers(state, client, lsp_path, supplemental);
         });
         true
     }

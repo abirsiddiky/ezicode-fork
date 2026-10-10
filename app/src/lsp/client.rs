@@ -223,8 +223,16 @@ impl LspManager {
 
     pub fn reserve_server(&mut self, lang: &str) -> Option<ServerLaunch> {
         let adapter = super::adapter::adapter_for_language(lang)?;
+        self.reserve_adapter(adapter)
+    }
+
+    /// Reserve the start of any server, primary or supplemental.
+    pub fn reserve_adapter(
+        &mut self,
+        adapter: &'static super::adapter::ServerAdapter,
+    ) -> Option<ServerLaunch> {
         let name = adapter.name;
-        if self.client_for(lang).is_some() {
+        if self.clients.get(name).is_some_and(|c| c.is_alive()) {
             return None;
         }
         if self.installing.contains(name)
@@ -429,6 +437,24 @@ impl LspManager {
             .filter(|c| c.is_alive())
     }
 
+    /// The live supplemental servers (Emmet, ...) for `lang`.
+    pub fn supplemental_clients_for(&self, lang: &str) -> Vec<Arc<LspClient>> {
+        super::adapter::supplemental_adapters_for_language(lang)
+            .into_iter()
+            .filter_map(|adapter| self.clients.get(adapter.name).cloned())
+            .filter(|c| c.is_alive())
+            .collect()
+    }
+
+    /// Every live server that should see documents of `lang`: the primary
+    /// server first, then the supplemental ones.
+    pub fn clients_for_language(&self, lang: &str) -> Vec<Arc<LspClient>> {
+        self.client_for(lang)
+            .into_iter()
+            .chain(self.supplemental_clients_for(lang))
+            .collect()
+    }
+
     /// Status of the server that handles `lang`.
     pub fn status_for_language(&self, lang: &str) -> Option<ServerStatus> {
         let adapter = super::adapter::adapter_for_language(lang)?;
@@ -451,19 +477,19 @@ impl LspManager {
     }
 
     pub fn change_document(&mut self, path: &Path, lang: &str, text: String) {
-        if let Some(client) = self.client_for(lang) {
-            client.did_change(path, text);
+        for client in self.clients_for_language(lang) {
+            client.did_change(path, text.clone());
         }
     }
 
     pub fn close_document(&mut self, path: &Path, lang: &str) {
-        if let Some(client) = self.client_for(lang) {
+        for client in self.clients_for_language(lang) {
             client.did_close(path);
         }
     }
 
     pub fn save_document(&mut self, path: &Path, lang: &str, text: &str) {
-        if let Some(client) = self.client_for(lang) {
+        for client in self.clients_for_language(lang) {
             client.did_save(path, text);
         }
     }
@@ -1160,9 +1186,15 @@ impl Drop for LspClient {
     }
 }
 
-pub fn attach_lsp_providers(state: &mut InputState, client: Arc<LspClient>, path: PathBuf) {
+pub fn attach_lsp_providers(
+    state: &mut InputState,
+    client: Arc<LspClient>,
+    path: PathBuf,
+    supplemental: Vec<Arc<LspClient>>,
+) {
     state.lsp.completion_provider = Some(Rc::new(LspCompletionProvider {
         client: client.clone(),
+        supplemental,
         path: path.clone(),
     }));
     state.lsp.hover_provider = Some(Rc::new(LspHoverProvider {
@@ -1189,7 +1221,21 @@ pub fn is_completion_trigger_char(c: char) -> bool {
 
 pub struct LspCompletionProvider {
     client: Arc<LspClient>,
+    /// Extra servers (Emmet) whose items are appended after the primary's.
+    supplemental: Vec<Arc<LspClient>>,
     path: PathBuf,
+}
+
+/// Concatenate the items of several completion responses, keeping their order.
+fn merge_completion_responses(responses: Vec<CompletionResponse>) -> CompletionResponse {
+    let mut items = Vec::new();
+    for response in responses {
+        match response {
+            CompletionResponse::Array(list) => items.extend(list),
+            CompletionResponse::List(list) => items.extend(list.items),
+        }
+    }
+    CompletionResponse::Array(items)
 }
 
 impl CompletionProvider for LspCompletionProvider {
@@ -1201,10 +1247,8 @@ impl CompletionProvider for LspCompletionProvider {
         _window: &mut Window,
         cx: &mut Context<InputState>,
     ) -> Task<anyhow::Result<CompletionResponse>> {
-        if !self.client.supports(|c| c.completion_provider.is_some()) {
-            return Task::ready(Ok(CompletionResponse::Array(vec![])));
-        }
-        let client = self.client.clone();
+        let mut clients = vec![self.client.clone()];
+        clients.extend(self.supplemental.iter().cloned());
         let path = self.path.clone();
         let text_str = text.to_string();
         let position = text.offset_to_position(offset);
@@ -1235,11 +1279,27 @@ impl CompletionProvider for LspCompletionProvider {
             let Ok(params) = serde_json::to_value(params) else {
                 return Ok(CompletionResponse::Array(vec![]));
             };
-            let response =
-                client.request_with_text(&path, &text_str, "textDocument/completion", params);
-            Ok(response
-                .and_then(|v| serde_json::from_value::<CompletionResponse>(v).ok())
-                .unwrap_or(CompletionResponse::Array(vec![])))
+
+            // Ask every server that completes; a server that is down or
+            // answers badly contributes nothing and the others still show.
+            let mut responses = Vec::new();
+            for client in clients {
+                if !client.is_alive() || !client.supports(|c| c.completion_provider.is_some()) {
+                    continue;
+                }
+                let response = client.request_with_text(
+                    &path,
+                    &text_str,
+                    "textDocument/completion",
+                    params.clone(),
+                );
+                if let Some(response) =
+                    response.and_then(|v| serde_json::from_value::<CompletionResponse>(v).ok())
+                {
+                    responses.push(response);
+                }
+            }
+            Ok(merge_completion_responses(responses))
         })
     }
 
@@ -1933,6 +1993,28 @@ mod tests {
             .expect("read ok")
             .expect("some msg");
         assert_eq!(msg["method"], "test");
+    }
+
+    #[test]
+    fn completion_responses_are_merged_in_server_order() {
+        let item = |label: &str| lsp_types::CompletionItem {
+            label: label.to_string(),
+            ..Default::default()
+        };
+        let merged = merge_completion_responses(vec![
+            CompletionResponse::Array(vec![item("div")]),
+            CompletionResponse::List(lsp_types::CompletionList {
+                is_incomplete: false,
+                items: vec![item("h1"), item("h2")],
+                ..Default::default()
+            }),
+            CompletionResponse::Array(vec![]),
+        ]);
+        let labels: Vec<_> = match merged {
+            CompletionResponse::Array(items) => items.into_iter().map(|i| i.label).collect(),
+            CompletionResponse::List(_) => panic!("merge should return a plain array"),
+        };
+        assert_eq!(labels, vec!["div", "h1", "h2"]);
     }
 
     #[test]

@@ -222,6 +222,18 @@ pub static ADAPTERS: &[ServerAdapter] = &[
         languages: &["html"],
     },
     ServerAdapter {
+        name: "emmet-language-server",
+        source: Source::Npm {
+            package: "emmet-language-server",
+            entry: "node_modules/emmet-language-server/out/server.js",
+        },
+        args: &["--stdio"],
+        // Zed's Emmet extension covers the same markup and stylesheet
+        // languages. Vue, Svelte and Astro files are `html` in `lang.rs`, so
+        // they are covered here too.
+        languages: &["html", "css", "jsx", "tsx"],
+    },
+    ServerAdapter {
         name: "json-language-server",
         source: Source::Npm {
             package: "vscode-langservers-extracted",
@@ -379,8 +391,29 @@ pub static ADAPTERS: &[ServerAdapter] = &[
     },
 ];
 
+/// Servers that run next to a language's primary server and only contribute
+/// completions (Zed's model for Emmet). They never own diagnostics, hover,
+/// definitions or the status bar, so they are never returned by
+/// [`adapter_for_language`].
+pub const SUPPLEMENTAL_SERVERS: &[&str] = &["emmet-language-server"];
+
+/// The primary server for `lang`: the first adapter that is not supplemental.
 pub fn adapter_for_language(lang: &str) -> Option<&'static ServerAdapter> {
-    ADAPTERS.iter().find(|a| a.languages.contains(&lang))
+    ADAPTERS
+        .iter()
+        .find(|a| !is_supplemental(a.name) && a.languages.contains(&lang))
+}
+
+/// The supplemental servers for `lang` (e.g. Emmet for `html`), in table order.
+pub fn supplemental_adapters_for_language(lang: &str) -> Vec<&'static ServerAdapter> {
+    ADAPTERS
+        .iter()
+        .filter(|a| is_supplemental(a.name) && a.languages.contains(&lang))
+        .collect()
+}
+
+pub fn is_supplemental(server: &str) -> bool {
+    SUPPLEMENTAL_SERVERS.contains(&server)
 }
 
 /// The adapter with this server name.
@@ -437,6 +470,34 @@ mod tests {
         assert_eq!(html.npm_package(), css.npm_package());
 
         assert_ne!(css.name, html.name);
+    }
+
+    #[test]
+    fn emmet_is_a_supplemental_server_not_a_primary_one() {
+        assert!(is_supplemental("emmet-language-server"));
+        for lang in ["html", "css", "jsx", "tsx"] {
+            assert_ne!(
+                adapter_for_language(lang).unwrap().name,
+                "emmet-language-server",
+                "{lang} primary server must stay the language server"
+            );
+            let extra: Vec<_> = supplemental_adapters_for_language(lang)
+                .iter()
+                .map(|a| a.name)
+                .collect();
+            assert_eq!(extra, vec!["emmet-language-server"], "{lang}");
+        }
+        assert!(supplemental_adapters_for_language("rust").is_empty());
+    }
+
+    #[test]
+    fn emmet_uses_the_published_entry_point_and_stdio() {
+        let emmet = adapter_by_name("emmet-language-server").unwrap();
+        assert_eq!(emmet.npm_package(), Some("emmet-language-server"));
+        assert_eq!(emmet.args, &["--stdio"]);
+        assert_eq!(emmet.language_id("jsx"), "javascriptreact");
+        assert_eq!(emmet.language_id("tsx"), "typescriptreact");
+        assert_eq!(emmet.language_id("html"), "html");
     }
 
     #[test]
