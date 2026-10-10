@@ -8,6 +8,7 @@ use lsp_types::{
 use ropey::Rope;
 use std::{cell::RefCell, ops::Range, rc::Rc, time::Duration};
 
+use super::snippet::{Snippet, SnippetSession};
 use crate::input::{
     InputState,
     popovers::{CompletionMenu, ContextMenu},
@@ -266,5 +267,81 @@ impl InputState {
         let completion_text = completion_item.insert_text;
         self.replace_text_in_range_silent(Some(range_utf16), &completion_text, window, cx);
         true
+    }
+}
+
+impl InputState {
+    /// Replace `range` with the expansion of `snippet` and start a snippet
+    /// session, selecting the first tabstop.
+    pub(crate) fn insert_snippet(
+        &mut self,
+        range: Range<usize>,
+        snippet: &Snippet,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.snippet_session = None;
+        let range_utf16 = self.range_to_utf16(&range);
+        self.replace_text_in_range_silent(Some(range_utf16), &snippet.text, window, cx);
+
+        let session = SnippetSession::new(snippet, range.start);
+        let first = session.current_range();
+        self.snippet_session = Some(session);
+        self.select_snippet_range(first, cx);
+    }
+
+    /// Tab (`forward`) or Shift-Tab while a snippet session is active.
+    ///
+    /// Returns `false` when no session is active, so the caller can run its
+    /// normal action.
+    pub(crate) fn snippet_jump(&mut self, forward: bool, cx: &mut Context<Self>) -> bool {
+        let Some(session) = self.snippet_session.as_mut() else {
+            return false;
+        };
+
+        let target = if forward {
+            session.next()
+        } else {
+            session.prev()
+        };
+
+        match target {
+            Some(range) => self.select_snippet_range(range, cx),
+            // Past `$0`: the snippet is done. Consume the key so Tab does not
+            // also insert indentation at the final position.
+            None if forward => self.snippet_session = None,
+            // Already on the first tabstop.
+            None => {}
+        }
+        true
+    }
+
+    /// End the snippet session if the selection has left the inserted text.
+    pub(crate) fn check_snippet_session_bounds(&mut self) {
+        let selection = self.selected_range;
+        let outside = self
+            .snippet_session
+            .as_ref()
+            .is_some_and(|s| !s.contains(selection.start) || !s.contains(selection.end));
+        if outside {
+            self.snippet_session = None;
+        }
+    }
+
+    /// Keep the snippet session's ranges in step with a text edit. Must be
+    /// called with the edit's range in the old text.
+    pub(crate) fn snippet_session_on_edit(&mut self, edit: Range<usize>, new_len: usize) {
+        if let Some(session) = self.snippet_session.as_mut() {
+            session.on_edit(edit, new_len);
+        }
+    }
+
+    fn select_snippet_range(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
+        self.selected_range = range.into();
+        self.selection_reversed = false;
+        self.scroll_to(self.selected_range.end, None, cx);
+        self.pause_blink_cursor(cx);
+        self.update_preferred_column();
+        cx.notify();
     }
 }

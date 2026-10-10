@@ -6,7 +6,7 @@ use gpui::{
     Point, Render, RenderOnce, SharedString, Styled, StyledText, Subscription, Window, canvas,
     deferred, div, prelude::FluentBuilder, px, relative,
 };
-use lsp_types::{CompletionItem, CompletionTextEdit};
+use lsp_types::{CompletionItem, CompletionTextEdit, InsertTextFormat};
 
 const MAX_MENU_WIDTH: Pixels = px(320.);
 const MAX_MENU_HEIGHT: Pixels = px(240.);
@@ -255,12 +255,18 @@ impl CompletionMenu {
                     range = offset..offset;
                 }
 
-                editor.replace_text_in_range_silent(
-                    Some(editor.range_to_utf16(&range)),
-                    &new_text,
-                    window,
-                    cx,
-                );
+                if item.insert_text_format == Some(InsertTextFormat::SNIPPET) {
+                    // `$1`, `${1:x}`, `$0`, ... must never reach the buffer.
+                    let snippet = crate::input::lsp::snippet::parse(&new_text);
+                    editor.insert_snippet(range, &snippet, window, cx);
+                } else {
+                    editor.replace_text_in_range_silent(
+                        Some(editor.range_to_utf16(&range)),
+                        &new_text,
+                        window,
+                        cx,
+                    );
+                }
                 editor.completion_inserting = false;
 
                 editor.focus(window, cx);

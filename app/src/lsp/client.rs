@@ -1181,6 +1181,9 @@ pub fn is_completion_trigger_char(c: char) -> bool {
         || matches!(
             c,
             '_' | '.' | '$' | ':' | '/' | '<' | '"' | '#' | '@' | '-' | '>' | '(' | '[' | '{'
+                // Emmet abbreviations: `li*3`, `ul>li+li`.
+                | '*'
+                | '+'
         )
 }
 
@@ -1937,6 +1940,9 @@ mod tests {
         assert!(is_completion_trigger_char('a'));
         assert!(is_completion_trigger_char('_'));
         assert!(is_completion_trigger_char('.'));
+        assert!(is_completion_trigger_char('*'));
+        assert!(is_completion_trigger_char('+'));
+        assert!(is_completion_trigger_char('>'));
         assert!(!is_completion_trigger_char(' '));
         assert!(!is_completion_trigger_char(';'));
     }
