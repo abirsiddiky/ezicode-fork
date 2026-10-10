@@ -22,6 +22,40 @@ use crate::{
     list::{List, ListDelegate, ListEvent, ListState},
 };
 
+/// Keep the items that match `query` and order them best match first.
+///
+/// Matching is case-insensitive. Prefix matches rank above matches with gaps;
+/// within each group the server's order is kept. An empty query keeps all items.
+pub(crate) fn filter_and_rank(items: Vec<CompletionItem>, query: &str) -> Vec<CompletionItem> {
+    if query.is_empty() {
+        return items;
+    }
+    let query = query.to_lowercase();
+    let mut scored: Vec<(u8, usize, CompletionItem)> = items
+        .into_iter()
+        .enumerate()
+        .filter_map(|(ix, item)| {
+            let candidate = item.filter_text.as_deref().unwrap_or(&item.label).to_lowercase();
+            match_rank(&query, &candidate).map(|rank| (rank, ix, item))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored.into_iter().map(|(_, _, item)| item).collect()
+}
+
+/// 2 for a prefix match, 1 when the query's characters appear in order, `None`
+/// otherwise.
+fn match_rank(query: &str, candidate: &str) -> Option<u8> {
+    if candidate.starts_with(query) {
+        return Some(2);
+    }
+    let mut chars = candidate.chars();
+    query
+        .chars()
+        .all(|q| chars.any(|c| c == q))
+        .then_some(1)
+}
+
 /// The documentation shown beside a completion item.
 ///
 /// Snippet bodies (Emmet's `!` boilerplate, for example) are shown expanded,
@@ -55,6 +89,48 @@ mod tests {
             insert_text_format: snippet.then_some(InsertTextFormat::SNIPPET),
             ..Default::default()
         }
+    }
+
+    fn labels(items: &[CompletionItem]) -> Vec<&str> {
+        items.iter().map(|i| i.label.as_str()).collect()
+    }
+
+    fn labelled(names: &[&str]) -> Vec<CompletionItem> {
+        names
+            .iter()
+            .map(|n| CompletionItem {
+                label: n.to_string(),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn typed_tag_name_filters_the_tag_list() {
+        let items = labelled(&["html", "head", "h1", "h2", "title", "hr"]);
+        let ranked = filter_and_rank(items, "h1");
+        assert_eq!(labels(&ranked), vec!["h1"]);
+    }
+
+    #[test]
+    fn prefix_matches_come_before_gap_matches_and_keep_server_order() {
+        let items = labelled(&["ahead", "head", "h2", "heading"]);
+        let ranked = filter_and_rank(items, "he");
+        assert_eq!(labels(&ranked), vec!["head", "heading", "ahead"]);
+    }
+
+    #[test]
+    fn filter_is_case_insensitive_and_empty_query_keeps_everything() {
+        let items = labelled(&["DIV", "span"]);
+        assert_eq!(labels(&filter_and_rank(items.clone(), "di")), vec!["DIV"]);
+        assert_eq!(labels(&filter_and_rank(items, "")), vec!["DIV", "span"]);
+    }
+
+    #[test]
+    fn filter_uses_filter_text_when_present() {
+        let mut item = labelled(&["!"]).remove(0);
+        item.filter_text = Some("html5 boilerplate".into());
+        assert_eq!(filter_and_rank(vec![item], "html").len(), 1);
     }
 
     #[test]
@@ -414,7 +490,9 @@ impl CompletionMenu {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let items = items.into();
+        // Servers return the whole candidate list and expect the editor to
+        // filter it by what was typed (`<h1` must show `h1`, not every tag).
+        let items = filter_and_rank(items.into(), &self.query);
         self.offset = offset;
         self.open = true;
         self.list.update(cx, |this, cx| {
