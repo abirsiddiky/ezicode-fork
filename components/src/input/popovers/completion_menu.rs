@@ -6,7 +6,7 @@ use gpui::{
     Point, Render, RenderOnce, SharedString, Styled, StyledText, Subscription, Window, canvas,
     deferred, div, prelude::FluentBuilder, px, relative,
 };
-use lsp_types::{CompletionItem, CompletionTextEdit, InsertTextFormat};
+use lsp_types::{CompletionItem, CompletionTextEdit, Documentation, InsertTextFormat};
 
 const MAX_MENU_WIDTH: Pixels = px(320.);
 const MAX_MENU_HEIGHT: Pixels = px(240.);
@@ -21,6 +21,70 @@ use crate::{
     label::Label,
     list::{List, ListDelegate, ListEvent, ListState},
 };
+
+/// The documentation shown beside a completion item.
+///
+/// Snippet bodies (Emmet's `!` boilerplate, for example) are shown expanded,
+/// as VS Code does: tabstops and placeholders become their default text and
+/// the result goes in a code block. No `$1` or `${...}` markers reach the popup.
+fn display_documentation(item: &CompletionItem) -> Option<String> {
+    let raw = match item.documentation.as_ref()? {
+        Documentation::String(s) => s.clone(),
+        Documentation::MarkupContent(markup) => markup.value.clone(),
+    };
+    if item.insert_text_format != Some(InsertTextFormat::SNIPPET) {
+        return Some(raw);
+    }
+    let expanded = crate::input::lsp::snippet::parse(&raw).text;
+    if expanded == raw {
+        Some(raw)
+    } else {
+        Some(format!("```\n{expanded}\n```"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lsp_types::MarkupContent;
+
+    fn item(doc: &str, snippet: bool) -> CompletionItem {
+        CompletionItem {
+            label: "!".into(),
+            documentation: Some(Documentation::String(doc.into())),
+            insert_text_format: snippet.then_some(InsertTextFormat::SNIPPET),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn snippet_documentation_hides_markers() {
+        let doc = display_documentation(&item("<div>${5:Document}</div>$6", true)).unwrap();
+        assert_eq!(doc, "```\n<div>Document</div>\n```");
+        assert!(!doc.contains('$'));
+    }
+
+    #[test]
+    fn plain_documentation_is_untouched() {
+        let doc = display_documentation(&item("costs $5 ${x}", false)).unwrap();
+        assert_eq!(doc, "costs $5 ${x}");
+    }
+
+    #[test]
+    fn snippet_without_markers_is_not_fenced() {
+        assert_eq!(display_documentation(&item("plain", true)).unwrap(), "plain");
+    }
+
+    #[test]
+    fn markup_documentation_is_read() {
+        let mut i = item("", false);
+        i.documentation = Some(Documentation::MarkupContent(MarkupContent {
+            kind: lsp_types::MarkupKind::Markdown,
+            value: "**hi**".into(),
+        }));
+        assert_eq!(display_documentation(&i).unwrap(), "**hi**");
+    }
+}
 
 struct ContextMenuDelegate {
     query: SharedString,
@@ -412,7 +476,7 @@ impl Render for CompletionMenu {
             .read(cx)
             .delegate()
             .selected_item()
-            .and_then(|item| item.documentation.clone());
+            .and_then(|item| display_documentation(item));
 
         let max_width = MAX_MENU_WIDTH.min(window.bounds().size.width - pos.x);
         let abs_pos = self.editor.read(cx).input_bounds.origin + pos;
@@ -444,11 +508,7 @@ impl Render for CompletionMenu {
                             .size_full(),
                         ),
                 )
-                .when_some(selected_documentation, |this, documentation| {
-                    let mut doc = match documentation {
-                        lsp_types::Documentation::String(s) => s.clone(),
-                        lsp_types::Documentation::MarkupContent(mc) => mc.value.clone(),
-                    };
+                .when_some(selected_documentation, |this, mut doc| {
                     if vertical_layout {
                         doc = doc.split("\n").next().unwrap_or_default().to_string();
                     }
