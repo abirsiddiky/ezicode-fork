@@ -1226,6 +1226,20 @@ pub struct LspCompletionProvider {
     path: PathBuf,
 }
 
+/// True while the user is typing a tag name right after `<` or `</`.
+pub fn is_typing_tag_name(before_cursor: &str) -> bool {
+    let word_start = match before_cursor
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '-' || *c == ':'))
+    {
+        Some((i, c)) => i + c.len_utf8(),
+        None => 0,
+    };
+    let before_word = &before_cursor[..word_start];
+    before_word.ends_with('<') || before_word.ends_with("</")
+}
+
 /// Concatenate the items of several completion responses, keeping their order.
 fn merge_completion_responses(responses: Vec<CompletionResponse>) -> CompletionResponse {
     let mut items = Vec::new();
@@ -1247,10 +1261,18 @@ impl CompletionProvider for LspCompletionProvider {
         _window: &mut Window,
         cx: &mut Context<InputState>,
     ) -> Task<anyhow::Result<CompletionResponse>> {
-        let mut clients = vec![self.client.clone()];
-        clients.extend(self.supplemental.iter().cloned());
-        let path = self.path.clone();
         let text_str = text.to_string();
+        // Emmet's abbreviation expansions are wrong while a tag name is being
+        // typed (`<h`, `</p`): only the HTML server answers there.
+        let before_cursor = text_str.get(..offset).unwrap_or("");
+        let tail = before_cursor
+            .get(before_cursor.len().saturating_sub(32)..)
+            .unwrap_or("");
+        let mut clients = vec![self.client.clone()];
+        if !is_typing_tag_name(tail) {
+            clients.extend(self.supplemental.iter().cloned());
+        }
+        let path = self.path.clone();
         let position = text.offset_to_position(offset);
 
         let trigger_character = trigger.trigger_character.filter(|c| c.chars().count() == 1);
@@ -1280,25 +1302,30 @@ impl CompletionProvider for LspCompletionProvider {
                 return Ok(CompletionResponse::Array(vec![]));
             };
 
-            // Ask every server that completes; a server that is down or
-            // answers badly contributes nothing and the others still show.
-            let mut responses = Vec::new();
-            for client in clients {
-                if !client.is_alive() || !client.supports(|c| c.completion_provider.is_some()) {
-                    continue;
-                }
-                let response = client.request_with_text(
-                    &path,
-                    &text_str,
-                    "textDocument/completion",
-                    params.clone(),
-                );
-                if let Some(response) =
-                    response.and_then(|v| serde_json::from_value::<CompletionResponse>(v).ok())
-                {
-                    responses.push(response);
-                }
-            }
+            // Ask every server at once: a slow or silent server must not delay
+            // the others. A server that is down or answers badly contributes
+            // nothing and the rest still show.
+            let responses: Vec<CompletionResponse> = std::thread::scope(|scope| {
+                let handles: Vec<_> = clients
+                    .iter()
+                    .filter(|c| {
+                        c.is_alive() && c.supports(|caps| caps.completion_provider.is_some())
+                    })
+                    .map(|client| {
+                        let params = params.clone();
+                        let path = &path;
+                        let text = &text_str;
+                        scope.spawn(move || {
+                            client.request_with_text(path, text, "textDocument/completion", params)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .filter_map(|handle| handle.join().ok().flatten())
+                    .filter_map(|v| serde_json::from_value::<CompletionResponse>(v).ok())
+                    .collect()
+            });
             Ok(merge_completion_responses(responses))
         })
     }
@@ -2036,6 +2063,18 @@ mod tests {
             CompletionResponse::List(_) => panic!("merge should return a plain array"),
         };
         assert_eq!(labels, vec!["div", "h1", "h2"]);
+    }
+
+    #[test]
+    fn tag_name_context_is_detected() {
+        assert!(is_typing_tag_name("<h"));
+        assert!(is_typing_tag_name("<div>\n  <p"));
+        assert!(is_typing_tag_name("</sec"));
+        assert!(is_typing_tag_name("<my-el"));
+        assert!(!is_typing_tag_name("<div class=\"x\""));
+        assert!(!is_typing_tag_name("h1"));
+        assert!(!is_typing_tag_name("<div>text h"));
+        assert!(!is_typing_tag_name("é <h1>x"));
     }
 
     #[test]
