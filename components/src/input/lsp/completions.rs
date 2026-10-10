@@ -1,5 +1,5 @@
 use anyhow::Result;
-use gpui::{Context, EntityInputHandler, Task, Window};
+use gpui::{Context, Task, Window};
 use lsp_types::{
     CompletionContext, CompletionItem, CompletionResponse, InlineCompletionContext,
     InlineCompletionItem, InlineCompletionResponse, InlineCompletionTriggerKind,
@@ -10,7 +10,7 @@ use std::{cell::RefCell, ops::Range, rc::Rc, time::Duration};
 
 use super::snippet::{Snippet, SnippetSession};
 use crate::input::{
-    InputState,
+    InputState, RopeExt,
     popovers::{CompletionMenu, ContextMenu},
 };
 
@@ -120,9 +120,10 @@ impl InputState {
         // it is `h1`. Completions are filtered against this text.
         // Only a short window before the cursor is copied: a whole-document
         // copy on every keystroke is needless work on the UI thread.
-        let window_start = self
-            .text
-            .char_to_byte(self.text.byte_to_char(new_offset.saturating_sub(128)));
+        let window_start = new_offset
+            .saturating_sub(128)
+            .clamp(0, self.text.offset_to_char_index(new_offset));
+        let window_start = self.text.char_index_to_offset(window_start);
         let before_cursor = self.text.slice(window_start..new_offset).to_string();
         let word_start = before_cursor
             .char_indices()
