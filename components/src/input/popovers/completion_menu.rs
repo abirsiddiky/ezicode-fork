@@ -477,9 +477,9 @@ impl CompletionMenu {
     }
 
     pub(crate) fn update_query(&mut self, start_offset: usize, query: impl Into<SharedString>) {
-        if self.trigger_start_offset.is_none() {
-            self.trigger_start_offset = Some(start_offset);
-        }
+        // The start moves with the word being typed, so accepting an item
+        // replaces the whole word (not the trigger character before it).
+        self.trigger_start_offset = Some(start_offset);
         self.query = query.into();
     }
 

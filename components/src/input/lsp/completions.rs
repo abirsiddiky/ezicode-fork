@@ -115,22 +115,19 @@ impl InputState {
             }
         };
 
-        let start_offset = menu.read(cx).trigger_start_offset.unwrap_or(start);
-        if new_offset < start_offset {
-            return;
-        }
-
-        let query = self
-            .text_for_range(
-                self.range_to_utf16(&(start_offset..new_offset)),
-                &mut None,
-                window,
-                cx,
-            )
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
+        // The query is the identifier being typed, up to the cursor. It must
+        // not include the trigger character: after `<` it is empty, after `<h1`
+        // it is `h1`. Completions are filtered against this text.
+        let before_cursor = self.text.slice(0..new_offset).to_string();
+        let word_start = before_cursor
+            .char_indices()
+            .rev()
+            .find(|(_, c)| !(c.is_alphanumeric() || *c == '_' || *c == '-'))
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        let query = before_cursor[word_start..].to_string();
         _ = menu.update(cx, |menu, _| {
-            menu.update_query(start_offset, query.clone());
+            menu.update_query(word_start, query.clone());
         });
 
         let completion_context = CompletionContext {
