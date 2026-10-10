@@ -2054,7 +2054,6 @@ mod tests {
             CompletionResponse::List(lsp_types::CompletionList {
                 is_incomplete: false,
                 items: vec![item("h1"), item("h2")],
-                ..Default::default()
             }),
             CompletionResponse::Array(vec![]),
         ]);
